@@ -1,0 +1,104 @@
+) Arena Dictionary (the index of everything)
+
+Where: At the very start of the Arena file header.
+How:
+
+Read big-endian header fields (these offsets are stable for the PS3 arenas you’ve shown):
+
+0x20 → numEntries
+
+0x30 → dictStart
+
+0x34 → sectionManifest (points to TYPES list)
+
+0x44 → mainResourceBase (base for BaseResource payloads)
+
+Build the Types table:
+
+Walk sectionManifest until you hit RW_CORE_SECTIONTYPES (0x00010005).
+
+Read its count and the array of type IDs. This lets each dictionary row’s typeIndex map to a real ERwObjectType ID.
+
+Parse the Dictionary:
+
+There are numEntries rows of 0x18 bytes starting at dictStart:
+ptr, size, align, typeIndex, typeId.
+
+Compute BlockStart/End per row:
+
+If the type is RW_CORE_BASERESOURCE_0..15 (0x00010030–0x3F), data lives in the secondary resource area → BlockStart = mainResourceBase + ptr.
+
+Otherwise data is in-place → BlockStart = ptr.
+
+From here you can filter rows by typeId to get exactly what you need next.
+
+2) VertexDescriptor (layout of each vertex)
+
+Where: Any dict row with RW_GRAPHICS_VERTEXDESCRIPTOR (0x000200E9).
+How (bytes at that row’s BlockStart):
+
+Header (16 bytes):
+refCount (I32), typesFlags (U32), numStreams (U16), numElements (U16), freqMask (U16), pad (U16)
+
+Elements: numElements × 8 bytes each:
+vertexType (U8), numComponents (U8), stream (U8), offset (U8), stride (U16), elementType (U8), elementClass (U8)
+
+Notes:
+
+PS3 big-endian floats/ints.
+
+Stride is usually consistent across elements; use the largest if they disagree.
+
+elementType gives you semantics: 0=XYZ, 1=WEIGHTS, 7=INDICES, 8..15=TEX0..7, 2=NORMAL, 14=TANGENT, 15=BINORMAL (per your tables).
+
+vertexType tells storage (F32, S16, F16, DEC3N, etc.).
+
+3) VertexBuffer (the actual vertex bytes)
+
+Where: Dict rows with RW_GRAPHICS_VERTEXBUFFER (0x000200EA).
+How:
+
+The VB header at the VB row’s BlockStart contains a U32 index to a BaseResource in the Arena Dictionary (think “indirection”).
+
+Jump to that BaseResource row (type in 0x00010030–0x3F). Its BlockStart/Size point to the raw vertex byte range.
+
+Vertex count = baseResourceSize / stride (use stride from the matching VertexDescriptor).
+
+Pairing VB ↔ VDES deterministically:
+
+Best: if a Renderable/RenderableMesh object is present, follow its buffer list.
+
+Otherwise: use dictionary order rule of thumb: pick the closest VertexDescriptor between this VB and the next VB; if none, pick the nearest preceding VDES. (This matches how these assets are authored.)
+
+4) IndexBuffer (the triangle list/strip)
+
+Where: Dict rows with RW_GRAPHICS_INDEXBUFFER (0x000200EB).
+How:
+
+Like VB, the IB header’s first U32 is a BaseResource index → follow to the BaseResource row to get the raw index bytes.
+
+Use the IB header’s metadata (if present) or the Renderable’s DrawIndexedParameters to know:
+
+stride (2=uint16 or 4=uint32; PS3 here is usually 16-bit),
+
+indexCount,
+
+primitiveType (you’ll usually see TRIANGLES (5)).
+
+Triangle count ≈ indexCount / 3 for TRIANGLES.
+
+5) Putting it together (sanity + wiring)
+
+Endianness: all integers and floats are big-endian in these PS3 dumps—convert on read.
+
+Sanity checks:
+
+typesFlags in VDES should match the union of elementTypes you parsed.
+
+Each element’s offset + elemSize must be ≤ stride.
+
+If you expect skinning, you should see elementType 1 (WEIGHTS) and 7 (INDICES) present.
+
+Bone indices/weights: these live in the VB per the VDES (not in the Arena header). Map them to your bone list (global or via palette if one exists).
+
+Heuristic when multiple VBs/IBs/VDES: group by proximity in the dictionary and/or by identical stride/vertex count. That’s how multi-submeshes in these PSGs are typically segmented.

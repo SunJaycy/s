@@ -1,0 +1,1739 @@
+// PSG2GLB.cs
+// Single-file WinForms app (.NET 6/8 Windows) that converts Skate 3 (PS3) .psg → glTF 2.0 .glb
+// - Integrates the user's PSG parsers (geometry + bones/skin) with *no semantic changes*
+// - Fixes: robust RW types table lookup, typed Carrier finder, identity bone-palette fallback,
+//          and writes joint node matrices from bind-pose (no stacked-at-origin bones).
+//
+// UI: "PSG → GLB (deterministic)" with "Open PSG…" and "Save GLB…" + multiline log.
+//
+// Build: <TargetFramework>net8.0-windows</TargetFramework> with <UseWindowsForms>true</UseWindowsForms>
+//        or net6.0-windows. No external dependencies.
+//
+// Constants for export behavior:
+#define NET8_OR6
+
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Numerics; // only for MathF utilities (not required)
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Windows.Forms;
+
+namespace PSG2GLB
+{
+    internal static class Program
+    {
+        [STAThread]
+        static void Main()
+        {
+            Application.EnableVisualStyles();
+            Application.Run(new MainForm());
+        }
+    }
+
+    public sealed class MainForm : Form
+    {
+        // ==== Export knobs ====
+        // Scale raw short positions (S16) → meters-ish
+        private const float POSITION_SCALE = 0.001f;   // tweakable per user request
+        // Optional transforms:
+        private const bool FLIP_V = false;             // if true, write v = 1 - v
+        private const bool SWAP_YZ = false;            // if true, swap Y/Z consistently (geometry + bones)
+
+        private Button btnOpen, btnSave;
+        private TextBox txtLog;
+        private byte[] fileBytes;
+        private string filePath;
+        private ParsedScene parsed; // geometry
+        private BoneSkinData bones; // skeleton/skin
+
+        public MainForm()
+        {
+            Text = "PSG → GLB (deterministic)";
+            StartPosition = FormStartPosition.CenterScreen;
+            MinimumSize = new Size(960, 640);
+            Size = new Size(1200, 800);
+
+            var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 48, Padding = new Padding(8, 8, 8, 8), FlowDirection = FlowDirection.LeftToRight };
+            btnOpen = new Button { Text = "Open PSG…", Width = 140, Height = 30, Margin = new Padding(4) };
+            btnSave = new Button { Text = "Save GLB…", Width = 140, Height = 30, Margin = new Padding(4), Enabled = false };
+            top.Controls.Add(btnOpen);
+            top.Controls.Add(btnSave);
+
+            txtLog = new TextBox { Dock = DockStyle.Fill, Multiline = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 9f) };
+
+            Controls.Add(txtLog);
+            Controls.Add(top);
+
+            btnOpen.Click += BtnOpen_Click;
+            btnSave.Click += BtnSave_Click;
+        }
+
+        private void Log(string s) => txtLog.AppendText(s + Environment.NewLine);
+
+        private void BtnOpen_Click(object sender, EventArgs e)
+        {
+            using var ofd = new OpenFileDialog { Title = "Open PSG", Filter = "PSG files (*.psg)|*.psg|All files (*.*)|*.*" };
+            if (ofd.ShowDialog(this) != DialogResult.OK) return;
+
+            try
+            {
+                fileBytes = File.ReadAllBytes(ofd.FileName);
+                filePath = ofd.FileName;
+                txtLog.Clear();
+                Log($"Loaded PSG: {filePath} ({fileBytes.Length:N0} bytes)");
+
+                // 1) Parse geometry (as-is semantics from viewer)
+                parsed = PsgParser.Parse(fileBytes, Log);
+                DumpSubmeshes(parsed);
+
+                // 2) Parse bones + palette + per-vertex skin (as-is semantics from bone exporter, with robust add-ons)
+                bones = BoneSkinCore.ParseBonesAndPaletteAndMaybeSkin(fileBytes, Log);
+
+                // 3) Attach per-submesh JOINTS_0/WEIGHTS_0 by reading the VB/VD that produced each SubMeshData
+                //    (We reuse bone-core utilities to read indices/weights for each submesh VB/VD pair)
+                AttachSkinToSubmeshes(parsed, bones, fileBytes, Log);
+
+                btnSave.Enabled = true;
+                Log("Parse complete. You can now Save GLB…");
+            }
+            catch (Exception ex)
+            {
+                Log($"[ERROR] {ex}");
+                btnSave.Enabled = false;
+            }
+        }
+
+        private void BtnSave_Click(object sender, EventArgs e)
+        {
+            if (parsed == null || parsed.SubMeshes.Count == 0)
+            {
+                MessageBox.Show(this, "Open a .psg first.", "Export", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            using var sfd = new SaveFileDialog
+            {
+                Title = "Save GLB",
+                Filter = "Binary glTF (*.glb)|*.glb",
+                FileName = Path.GetFileNameWithoutExtension(filePath) + ".glb"
+            };
+            if (sfd.ShowDialog(this) != DialogResult.OK) return;
+
+            try
+            {
+                var glb = new GlbBuilder(Log);
+
+                // Build nodes for bones (if any skin)
+                int skinIndex = -1;
+                int meshNode = -1;
+
+                // Build mesh with one glTF mesh (multiple primitives), morph targets as deltas
+                var meshIndex = glb.BeginMesh(Path.GetFileNameWithoutExtension(filePath));
+
+                // Prepare material once (basic)
+                int materialIndex = glb.AddDefaultMaterial();
+
+                // Build geometry per submesh
+                var targetNames = new List<string>();
+                for (int smi = 0; smi < parsed.SubMeshes.Count; smi++)
+                {
+                    var sm = parsed.SubMeshes[smi];
+                    if (sm.Triangles.Count == 0 || sm.Positions.Count == 0) continue;
+
+                    // Geometry arrays (apply scale / transforms)
+                    var pos = new List<float>(sm.Positions.Count * 3);
+                    var nrm = new List<float>(sm.Normals.Count * 3);
+                    var tan = new List<float>(sm.Tangents.Count * 4);
+                    var uv0 = new List<float>(sm.UVs.Count * 2);
+
+                    for (int i = 0; i < sm.Positions.Count; i++)
+                    {
+                        var p = sm.Positions[i];
+                        var n = (i < sm.Normals.Count) ? sm.Normals[i] : new Vec3(0, 0, 1);
+                        var t = (i < sm.Tangents.Count) ? sm.Tangents[i] : new Vec3(1, 0, 0);
+                        var b = (i < sm.Binormals.Count) ? sm.Binormals[i] : new Vec3(0, 1, 0);
+
+                        // scale S16→meters
+                        p = new Vec3(p.X * POSITION_SCALE, p.Y * POSITION_SCALE, p.Z * POSITION_SCALE);
+
+                        if (SWAP_YZ)
+                        {
+                            p = Vec3.SwapYZ(p);
+                            n = Vec3.SwapYZ(n);
+                            t = Vec3.SwapYZ(t);
+                            b = Vec3.SwapYZ(b);
+                        }
+
+                        pos.Add(p.X); pos.Add(p.Y); pos.Add(p.Z);
+                        n = Vec3.Normalize(n);
+                        nrm.Add(n.X); nrm.Add(n.Y); nrm.Add(n.Z);
+
+                        // Tangent w = sign of bitangent: dot(cross(N,T), B) ∈ {-1,+1}
+                        float sign = 1f;
+                        var crossNT = Vec3.Cross(n, Vec3.Normalize(t));
+                        float dot = Vec3.Dot(Vec3.Normalize(crossNT), Vec3.Normalize(b));
+                        if (dot < -0.001f) sign = -1f;
+                        tan.Add(t.X); tan.Add(t.Y); tan.Add(t.Z); tan.Add(sign);
+
+                        var uv = (i < sm.UVs.Count) ? sm.UVs[i] : new Vec2(0, 0);
+                        float u = uv.X; float v = uv.Y;
+                        if (FLIP_V) v = 1f - v;
+                        uv0.Add(u); uv0.Add(v);
+                    }
+
+                    // Indices
+                    var idx = new List<uint>(sm.Triangles.Count * 3);
+                    foreach (var tr in sm.Triangles) { idx.Add((uint)tr.A); idx.Add((uint)tr.B); idx.Add((uint)tr.C); }
+
+                    // Skin (if present for this submesh)
+                    List<byte> joints = null;
+                    List<float> weights = null;
+                    if (sm.Skin != null && sm.Skin.Indices != null && sm.Skin.Weights != null &&
+                        sm.Skin.Indices.Count == sm.Positions.Count * 4 &&
+                        sm.Skin.Weights.Count == sm.Positions.Count * 4)
+                    {
+                        joints = sm.Skin.Indices;
+                        weights = sm.Skin.Weights;
+                    }
+
+                    // Morph targets (POSITION deltas, scaled/transformed like base)
+                    var targets = new List<GlbBuilder.Target>();
+                    if (sm.Morphs.Count > 0)
+                    {
+                        foreach (var mt in sm.Morphs)
+                        {
+                            if (mt.Positions.Count != sm.Positions.Count) continue;
+                            var deltas = new List<float>(sm.Positions.Count * 3);
+                            for (int i = 0; i < sm.Positions.Count; i++)
+                            {
+                                var baseP = sm.Positions[i];
+                                var morpP = mt.Positions[i];
+                                baseP = new Vec3(baseP.X * POSITION_SCALE, baseP.Y * POSITION_SCALE, baseP.Z * POSITION_SCALE);
+                                morpP = new Vec3(morpP.X * POSITION_SCALE, morpP.Y * POSITION_SCALE, morpP.Z * POSITION_SCALE);
+                                if (SWAP_YZ) { baseP = Vec3.SwapYZ(baseP); morpP = Vec3.SwapYZ(morpP); }
+                                var d = new Vec3(morpP.X - baseP.X, morpP.Y - baseP.Y, morpP.Z - baseP.Z);
+                                deltas.Add(d.X); deltas.Add(d.Y); deltas.Add(d.Z);
+                            }
+                            targets.Add(new GlbBuilder.Target { PositionDeltas = deltas });
+                            targetNames.Add(mt.Name);
+                        }
+                    }
+
+                    glb.AddPrimitive(meshIndex, pos, nrm, tan, uv0, joints, weights, idx, materialIndex, targets);
+                }
+
+                if (targetNames.Count > 0) glb.SetMeshTargetNames(meshIndex, targetNames);
+
+                // Create joint nodes if skinning present anywhere
+                bool anySkin = parsed.SubMeshes.Any(s => s.Skin != null && s.Skin.Indices != null);
+                int meshNodeIndex;
+                if (anySkin && bones != null && bones.BoneCount > 0)
+                {
+                    // Build bone nodes from bind pose: world binds → local, then write node.matrix (column-major)
+                    var localBindRow = ComputeLocalBindRowMatrices(bones);
+
+                    // Apply SWAP_YZ coherently to bones if enabled
+                    if (SWAP_YZ)
+                    {
+                        var S = SwapYZMatrixRowMajor();
+                        var Sinv = S; // S == S^{-1} for a pure axis swap
+                        for (int i = 0; i < localBindRow.Length; i++)
+                            localBindRow[i] = Mul(Mul(S, localBindRow[i]), Sinv);
+
+                        // Also convert IBMs to the same basis: IBM' = S * IBM * S^{-1}
+                        for (int i = 0; i < bones.IBMs.Count; i++)
+                            bones.IBMs[i] = Mul(Mul(S, bones.IBMs[i]), Sinv);
+                    }
+
+                    // Create nodes
+                    var nodeIndices = new int[bones.BoneCount];
+                    for (int i = 0; i < bones.BoneCount; i++)
+                    {
+                        nodeIndices[i] = glb.AddNode(new GlbBuilder.Node
+                        {
+                            name = bones.BoneNames[i],
+                            matrix = RowToCol16(localBindRow[i]),
+                            children = new List<int>()
+                        });
+                    }
+                    // Children wiring
+                    var roots = new List<int>();
+                    for (int i = 0; i < bones.BoneCount; i++)
+                    {
+                        int p = bones.Parents[i];
+                        if (p >= 0 && p < bones.BoneCount) glb.Nodes[nodeIndices[p]].children.Add(nodeIndices[i]);
+                        else roots.Add(nodeIndices[i]);
+                    }
+                    // Skin with inverseBindMatrices accessor (FLOAT_MAT4) in the same order
+                    var ibmCol = new List<float>(bones.BoneCount * 16);
+                    for (int i = 0; i < bones.BoneCount; i++)
+                    {
+                        var col = RowToCol16(bones.IBMs[i]);
+                        ibmCol.AddRange(col);
+                    }
+                    skinIndex = glb.AddSkin(nodeIndices.ToList(), roots.Count > 0 ? roots[0] : nodeIndices[0], ibmCol);
+
+                    // Mesh node referencing the skin
+                    meshNode = glb.AddNode(new GlbBuilder.Node
+                    {
+                        name = "Mesh",
+                        mesh = meshIndex,
+                        skin = skinIndex
+                    });
+                    meshNodeIndex = meshNode;
+
+                    // Add roots plus mesh node to scene
+                    foreach (var r in roots) glb.AddSceneNode(r);
+                    glb.AddSceneNode(meshNodeIndex);
+                }
+                else
+                {
+                    // No skin: just a mesh node
+                    meshNode = glb.AddNode(new GlbBuilder.Node { name = "Mesh", mesh = meshIndex });
+                    glb.AddSceneNode(meshNode);
+                }
+
+                var bytes = glb.BuildGlb();
+                File.WriteAllBytes(sfd.FileName, bytes);
+                Log($"[Write] {sfd.FileName} ({bytes.Length:N0} bytes)");
+                MessageBox.Show(this, "Export complete.", "Done", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                Log($"[ERROR] Export failed: {ex}");
+                MessageBox.Show(this, $"Export failed:\n{ex}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void DumpSubmeshes(ParsedScene scene)
+        {
+            Log("");
+            Log("=== Submeshes ===");
+            for (int i = 0; i < scene.SubMeshes.Count; i++)
+            {
+                var sm = scene.SubMeshes[i];
+                Log($"[{i:00}] {sm.Name}  V={sm.Positions.Count}  T={sm.Triangles.Count}  stride={sm.VertexStride}  morphs={sm.Morphs.Count}");
+            }
+        }
+
+        // Attach JOINTS_0 / WEIGHTS_0 per submesh from VB/VD, mapping palette→global (identity allowed)
+        private static void AttachSkinToSubmeshes(ParsedScene parsed, BoneSkinData bones, byte[] d, Action<string> LOG)
+        {
+            if (bones == null || bones.BoneCount == 0) return;
+
+            // Build arena view once
+            var arena = BoneSkinCore.ParseArena(d, LOG);
+
+            // Rebuild lookups for VB/VD dictionary indices
+            var listVD = arena.Dict.Where(x => x.TypeId == 0x000200E9).OrderBy(x => x.Index).ToList();
+            var listVB = arena.Dict.Where(x => x.TypeId == 0x000200EA).OrderBy(x => x.Index).ToList();
+
+            foreach (var sm in parsed.SubMeshes)
+            {
+                // Skip non-drawable
+                if (sm.Positions.Count == 0) continue;
+
+                // Find the exact VD/VB entries used by this submesh (by dict index)
+                var vdEntry = listVD.FirstOrDefault(v => v.Index == sm.VdIndex);
+                var vbEntry = listVB.FirstOrDefault(v => v.Index == sm.VbIndex);
+
+                if (vdEntry == null || vbEntry == null)
+                {
+                    LOG?.Invoke($"[Skin] Submesh {sm.Name}: missing VD/VB entries for skin probing; skipping skin.");
+                    continue;
+                }
+
+                // Parse the VD (PS3) exactly as the bone parser does (to pick elements)
+                var vd = BoneSkinCore.ParseVDES(d, vdEntry.BlockStart, vdEntry.BlockEnd);
+
+                // Need JOINTS(Type=7) + WEIGHTS(Type=1)
+                var elIdx = vd.RawElems.FirstOrDefault(e => e.Type == 7);
+                var elWgt = vd.RawElems.FirstOrDefault(e => e.Type == 1);
+                bool ok = vd.RawElems.Any(e => e.Type == 7) && vd.RawElems.Any(e => e.Type == 1);
+
+                if (!ok)
+                {
+                    LOG?.Invoke($"[Skin] Submesh {sm.Name}: VD lacks INDICES/WEIGHTS; skipping skin.");
+                    continue;
+                }
+
+                // VB → BaseResource
+                if (vbEntry.BlockStart + 12 > d.Length)
+                {
+                    LOG?.Invoke($"[Skin] VB header OOB for {sm.Name}; skipping.");
+                    continue;
+                }
+                uint vbBRIndex = BoneSkinCore.BE.U32(d, vbEntry.BlockStart + 0);
+                var brVB = arena.Dict.ElementAtOrDefault((int)vbBRIndex);
+                if (brVB == null || !arena.IsBaseResource(brVB.TypeId))
+                {
+                    LOG?.Invoke($"[Skin] VB→BaseResource invalid for {sm.Name}; skipping.");
+                    continue;
+                }
+
+                int vbStart = brVB.BlockStart;
+                int stride = vd.Stride > 0 ? vd.Stride : sm.VertexStride;
+                int vCount = sm.Positions.Count;
+
+                // Extract joints/weights and map palette→global (bones.Palette)
+                var joints = new List<byte>(vCount * 4);
+                var weights = new List<float>(vCount * 4);
+
+                for (int v = 0; v < vCount; v++)
+                {
+                    int baseOff = vbStart + v * stride;
+
+                    byte i0 = ReadIndexByte(d, baseOff + elIdx.Offset + 0);
+                    byte i1 = ReadIndexByte(d, baseOff + elIdx.Offset + 1);
+                    byte i2 = ReadIndexByte(d, baseOff + elIdx.Offset + 2);
+                    byte i3 = ReadIndexByte(d, baseOff + elIdx.Offset + 3);
+
+                    float w0 = ReadWeight(d, baseOff + elWgt.Offset + 0, elWgt.VertexType);
+                    float w1 = ReadWeight(d, baseOff + elWgt.Offset + 1, elWgt.VertexType);
+                    float w2 = ReadWeight(d, baseOff + elWgt.Offset + 2, elWgt.VertexType);
+                    float w3 = ReadWeight(d, baseOff + elWgt.Offset + 3, elWgt.VertexType);
+
+                    int g0 = MapPalette(i0, bones); int g1 = MapPalette(i1, bones);
+                    int g2 = MapPalette(i2, bones); int g3 = MapPalette(i3, bones);
+
+                    // Normalize weights to sum <= 1
+                    float sum = w0 + w1 + w2 + w3;
+                    if (sum > 0f)
+                    {
+                        w0 /= sum; w1 /= sum; w2 /= sum; w3 /= sum;
+                    }
+
+                    // Store as UBYTE4 + FLOAT4
+                    joints.Add((byte)Math.Max(0, Math.Min(255, g0)));
+                    joints.Add((byte)Math.Max(0, Math.Min(255, g1)));
+                    joints.Add((byte)Math.Max(0, Math.Min(255, g2)));
+                    joints.Add((byte)Math.Max(0, Math.Min(255, g3)));
+
+                    weights.Add(w0); weights.Add(w1); weights.Add(w2); weights.Add(w3);
+                }
+
+                sm.Skin = new SubMeshSkin { Indices = joints, Weights = weights };
+                LOG?.Invoke($"[Skin] Attached JOINTS/WEIGHTS to {sm.Name} (v={vCount})");
+            }
+
+            static int MapPalette(byte paletteIndex, BoneSkinData bones)
+            {
+                if (bones.Palette != null && paletteIndex < bones.Palette.Length) return bones.Palette[paletteIndex];
+                // identity fallback: assume indices are already global
+                return paletteIndex;
+            }
+        }
+
+        private static float[,] SwapYZMatrixRowMajor()
+        {
+            // Swap Y and Z basis: (X stays X, Y↔Z)
+            var S = new float[4, 4];
+            S[0, 0] = 1; S[1, 2] = 1; S[2, 1] = 1; S[3, 3] = 1;
+            return S;
+        }
+
+        private static float[] RowToCol16(float[,] M)
+        {
+            var v = new float[16]; int k = 0;
+            for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) v[k++] = M[r, c];
+            return v;
+        }
+
+        private static float[,] Mul(float[,] A, float[,] B)
+        {
+            var R = new float[4, 4];
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 4; c++)
+                    R[r, c] = A[r, 0] * B[0, c] + A[r, 1] * B[1, c] + A[r, 2] * B[2, c] + A[r, 3] * B[3, c];
+            return R;
+        }
+
+        private static float[,] Inv(float[,] M) => Inverse4x4(M);
+
+        private static float[][,] ComputeLocalBindRowMatrices(BoneSkinData bones)
+        {
+            int n = bones.BoneCount;
+            var local = new float[n][,];
+            for (int i = 0; i < n; i++)
+            {
+                var B = bones.BindMatrices[i]; // world bind (row-major)
+                int p = bones.Parents[i];
+                if (p < 0) local[i] = B;
+                else local[i] = Mul(Inv(bones.BindMatrices[p]), B);
+            }
+            return local;
+        }
+
+        private static byte ReadIndexByte(byte[] d, int off) => (off >= 0 && off < d.Length) ? d[off] : (byte)0;
+
+        private static float ReadWeight(byte[] d, int off, byte vertexType)
+        {
+            if (off < 0 || off >= d.Length) return 0f;
+            switch (vertexType)
+            {
+                case 0x07: // UB256 (U8 non-norm)
+                case 0x04: // UB normalized
+                    return d[off] / 255.0f;
+                case 0x02: // F32
+                    if (off + 4 <= d.Length) return BoneSkinCore.BE.F32(d, off);
+                    return 0f;
+                default:
+                    return d[off] / 255.0f;
+            }
+        }
+
+        // ======= Minimal math (from viewer) =======
+        struct Vec2 { public float X, Y; public Vec2(float x, float y) { X = x; Y = y; } }
+        struct Vec3
+        {
+            public float X, Y, Z;
+            public Vec3(float x, float y, float z) { X = x; Y = y; Z = z; }
+            public static Vec3 operator +(Vec3 a, Vec3 b) => new Vec3(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
+            public static Vec3 operator -(Vec3 a, Vec3 b) => new Vec3(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
+            public static Vec3 operator *(Vec3 a, float s) => new Vec3(a.X * s, a.Y * s, a.Z * s);
+            public float Length() => (float)Math.Sqrt(X * X + Y * Y + Z * Z);
+            public static float Dot(in Vec3 a, in Vec3 b) => a.X * b.X + a.Y * b.Y + a.Z * b.Z;
+            public static Vec3 Cross(in Vec3 a, in Vec3 b) => new Vec3(a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X);
+            public static Vec3 Normalize(in Vec3 v) { float l = v.Length(); return (l > 1e-8f) ? new Vec3(v.X / l, v.Y / l, v.Z / l) : new Vec3(0, 1, 0); }
+            public static Vec3 SwapYZ(in Vec3 v) => new Vec3(v.X, v.Z, v.Y);
+        }
+        struct Tri { public int A, B, C; public Tri(int a, int b, int c) { A = a; B = b; C = c; } }
+
+        // ======= Geometry structures =======
+        sealed class MorphTarget { public string Name; public readonly List<Vec3> Positions = new(); }
+        sealed class SubMeshSkin { public List<byte> Indices; public List<float> Weights; }
+        sealed class SubMesh
+        {
+            public string Name;
+            public int VertexStride;
+            public int VbIndex, IbIndex, VdIndex; // dictionary indices
+            public readonly List<Vec3> Positions = new();
+            public readonly List<Vec2> UVs = new();
+            public readonly List<Vec3> Normals = new();
+            public readonly List<Vec3> Tangents = new();
+            public readonly List<Vec3> Binormals = new();
+            public readonly List<Tri> Triangles = new();
+            public readonly List<MorphTarget> Morphs = new();
+            public SubMeshSkin Skin; // filled later
+            public override string ToString() => Name;
+        }
+        sealed class ParsedScene
+        {
+            public string SourceFile;
+            public readonly List<SubMesh> SubMeshes = new();
+        }
+
+        // ======= Bone/Skin structures =======
+        sealed class BoneSkinData
+        {
+            public int BoneCount;
+            public string[] BoneNames;
+            public List<float[,]> IBMs;         // row-major
+            public List<float[,]> BindMatrices; // row-major (inverse(IBM))
+            public int[] Parents;               // parent index or -1
+            public int[] Palette;               // palette slot -> global bone index (identity allowed)
+        }
+
+        // ====== PSG geometry parser (from user's PSG_Viewer_Skate3_PS3_VertexFlagsCorrect.cs; semantics preserved) ======
+        static class PsgParser
+        {
+            // (trimmed to essentials used by this exporter; semantics & element decoding preserved)
+            const uint RW_CORE_SECTIONTYPES = 0x00010005;
+            const uint RW_GRAPHICS_VERTEXDESCRIPTOR = 0x000200E9;
+            const uint RW_GRAPHICS_VERTEXBUFFER = 0x000200EA;
+            const uint RW_GRAPHICS_INDEXBUFFER = 0x000200EB;
+
+            static bool IsBaseResource(uint type) => (type >= 0x00010030 && type <= 0x0001003F);
+
+            public static ParsedScene Parse(byte[] file, Action<string> LOG)
+            {
+                var scene = new ParsedScene { SourceFile = "PSG" };
+                if (file.Length < 0x90) throw new InvalidDataException("Too small to be a valid Arena.");
+                uint numEntries = BE.U32(file, 0x20);
+                uint dictStart = BE.U32(file, 0x30);
+                uint sectMan = BE.U32(file, 0x34); // viewer uses 0x34 and works broadly
+                uint mainBase = BE.U32(file, 0x44);
+                LOG?.Invoke($"[Header] entries={numEntries} dict@0x{dictStart:X} mainResourceBase@0x{mainBase:X}");
+
+                var types = new List<uint>();
+                if (sectMan != 0)
+                {
+                    for (int p = (int)sectMan; p <= file.Length - 12; p += 4)
+                    {
+                        uint t = BE.U32(file, p + 0);
+                        if (t != RW_CORE_SECTIONTYPES) continue;
+                        uint num = BE.U32(file, p + 4);
+                        uint dictOff = BE.U32(file, p + 8);
+                        int tp = p + (int)dictOff;
+                        for (int i = 0; i < num && (tp + i * 4) <= file.Length - 4; i++) types.Add(BE.U32(file, tp + i * 4));
+                        LOG?.Invoke($"[Types] count={types.Count}");
+                        break;
+                    }
+                }
+
+                var dict = new List<DictEntry>();
+                for (int i = 0, q = (int)dictStart; i < numEntries && q + 0x18 <= file.Length; i++, q += 0x18)
+                {
+                    uint ptr = BE.U32(file, q + 0x00);
+                    uint size = BE.U32(file, q + 0x08);
+                    uint typeIndex = BE.U32(file, q + 0x10);
+                    uint typeId = BE.U32(file, q + 0x14);
+                    if (types.Count > 0 && typeIndex < types.Count) typeId = types[(int)typeIndex];
+
+                    int blockStart = IsBaseResource(typeId) ? (int)(mainBase + ptr) : (int)ptr;
+                    int blockEnd = Math.Min(file.Length, Math.Max(blockStart, blockStart + (int)size));
+                    dict.Add(new DictEntry { Index = i, TypeId = typeId, BlockStart = blockStart, BlockEnd = blockEnd });
+                }
+
+                var listVD = dict.Where(d => d.TypeId == RW_GRAPHICS_VERTEXDESCRIPTOR).OrderBy(d => d.Index).ToList();
+                var listVB = dict.Where(d => d.TypeId == RW_GRAPHICS_VERTEXBUFFER).OrderBy(d => d.Index).ToList();
+                var listIB = dict.Where(d => d.TypeId == RW_GRAPHICS_INDEXBUFFER).OrderBy(d => d.Index).ToList();
+                LOG?.Invoke($"[Counts] VDES={listVD.Count} VB={listVB.Count} IB={listIB.Count}");
+
+                var vdInfos = listVD.Select(vd => ParseVDES(file, vd.BlockStart, vd.BlockEnd, LOG)).ToList();
+
+                int NextVDForVB(int vbDictIndex)
+                {
+                    int nextVbIndex = listVB.Where(v => v.Index > vbDictIndex).Select(v => v.Index).DefaultIfEmpty(int.MaxValue).Min();
+                    var vdBetween = listVD.Where(v => v.Index > vbDictIndex && v.Index < nextVbIndex).OrderBy(v => v.Index).FirstOrDefault();
+                    if (vdBetween != null) return listVD.IndexOf(vdBetween);
+                    var vdBefore = listVD.Where(v => v.Index < vbDictIndex).OrderBy(v => Math.Abs(v.Index - vbDictIndex)).FirstOrDefault();
+                    if (vdBefore != null) return listVD.IndexOf(vdBefore);
+                    return 0;
+                }
+
+                var subTriples = new List<(DictEntry vb, int vdInfoIdx, DictEntry ib)>();
+                if (listVB.Count == listIB.Count)
+                {
+                    for (int i = 0; i < listVB.Count; i++) { var vb = listVB[i]; var ib = listIB[i]; subTriples.Add((vb, NextVDForVB(vb.Index), ib)); }
+                }
+                else
+                {
+                    var used = new HashSet<int>();
+                    foreach (var ib in listIB)
+                    {
+                        var vb = listVB.OrderBy(v => Math.Abs(v.Index - ib.Index)).First();
+                        used.Add(vb.Index);
+                        subTriples.Add((vb, NextVDForVB(vb.Index), ib));
+                    }
+                    foreach (var vb in listVB) if (!used.Contains(vb.Index)) subTriples.Add((vb, NextVDForVB(vb.Index), null));
+                }
+
+                int smCounter = 0;
+                foreach (var (vb, vdIdx, ib) in subTriples)
+                {
+                    var vd = vdInfos[vdIdx];
+                    var sm = new SubMesh
+                    {
+                        Name = $"SM_{smCounter++:00}_VB{vb.Index}_IB{(ib?.Index.ToString() ?? "—")}",
+                        VbIndex = vb.Index,
+                        IbIndex = ib?.Index ?? -1,
+                        VdIndex = listVD[vdIdx].Index
+                    };
+                    LOG?.Invoke($"[SubMesh] {sm.Name}  uses VDES#{listVD[vdIdx].Index}  VB#{vb.Index}  IB#{(ib?.Index.ToString() ?? "none")}");
+
+                    // VB → BaseResource header
+                    if (vb.BlockStart + 12 > file.Length) throw new InvalidDataException("VB header OOB.");
+                    uint vbBRIndex = BE.U32(file, vb.BlockStart + 0);
+                    var brVB = dict.ElementAtOrDefault((int)vbBRIndex);
+                    if (brVB == null || !IsBaseResource(brVB.TypeId)) throw new InvalidDataException("VB → BaseResource index invalid.");
+                    int vbStart = brVB.BlockStart; int vbSize = brVB.BlockEnd - brVB.BlockStart; int stride = vd.Stride > 0 ? vd.Stride : vbSize; int vCount = (stride > 0) ? Math.Max(0, vbSize / stride) : 0; sm.VertexStride = stride;
+
+                    int ibStart = -1, ibCount16 = 0;
+                    if (ib != null)
+                    {
+                        if (ib.BlockStart + 16 > file.Length) throw new InvalidDataException("IB header OOB.");
+                        uint ibBRIndex = BE.U32(file, ib.BlockStart + 0);
+                        var brIB = dict.ElementAtOrDefault((int)ibBRIndex);
+                        if (brIB == null || !IsBaseResource(brIB.TypeId)) throw new InvalidDataException("IB → BaseResource index invalid.");
+                        ibStart = brIB.BlockStart; int ibSize = brIB.BlockEnd - brIB.BlockStart; ibCount16 = Math.Max(0, ibSize / 2);
+                        LOG?.Invoke($"  VB BR#{vbBRIndex} @0x{vbStart:X} size=0x{vbSize:X} → vCount≈{vCount}");
+                        LOG?.Invoke($"  IB BR#{ibBRIndex} @0x{ibStart:X} size=0x{ibSize:X}");
+                    }
+                    else LOG?.Invoke($"  VB BR#{vbBRIndex} @0x{vbStart:X} size=0x{vbSize:X} → vCount≈{vCount}");
+
+                    // Read vertices (XYZ / TEX0 / NRM / TAN / BIN) (semantics per viewer)
+                    for (int i = 0; i < vCount; i++)
+                    {
+                        int vOff = vbStart + i * stride;
+
+                        // Position
+                        Vec3 P = DecodePosition(file, vOff, vd.PosElem);
+                        sm.Positions.Add(P);
+
+                        // UVs (TEX0)
+                        Vec2 UV = DecodeUV(file, vOff, vd);
+                        sm.UVs.Add(UV);
+
+                        // Normals / Tangents / Binormals
+                        sm.Normals.Add(DecodeDir(file, vOff, vd.NormalElem));
+                        sm.Tangents.Add(DecodeDir(file, vOff, vd.TangentElem));
+                        sm.Binormals.Add(DecodeDir(file, vOff, vd.BinormalElem));
+                    }
+
+                    // Indices
+                    if (ibStart >= 0 && ibCount16 >= 3)
+                    {
+                        int triCount = ibCount16 / 3;
+                        for (int i = 0; i < triCount; i++)
+                        {
+                            int a = BE.U16(file, ibStart + (i * 6) + 0);
+                            int b = BE.U16(file, ibStart + (i * 6) + 2);
+                            int c = BE.U16(file, ibStart + (i * 6) + 4);
+                            if ((uint)a < (uint)vCount && (uint)b < (uint)vCount && (uint)c < (uint)vCount) sm.Triangles.Add(new Tri(a, b, c));
+                        }
+                    }
+
+                    RecomputeNormalsIfNeeded(sm);
+                    scene.SubMeshes.Add(sm);
+                }
+
+                // Attach VB-only as morphs (as in viewer)
+                AttachMorphTargets(scene, LOG);
+
+                return scene;
+            }
+
+            // ===== Helpers (from viewer, semantics preserved) =====
+
+            sealed class DictEntry { public int Index; public uint TypeId; public int BlockStart, BlockEnd; }
+
+            // PS3 VertexDescriptor element (8 bytes)
+            struct VDElem
+            {
+                public byte VertexType; public byte NumComponents; public byte Stream; public byte Offset; public ushort Stride; public byte Type; public byte Class;
+            }
+            sealed class VDInfo
+            {
+                public int Stride;
+                public VDElem? PosElem; public VDElem? NormalElem; public VDElem? TangentElem; public VDElem? BinormalElem;
+                public readonly Dictionary<int, VDElem> TexElems = new(); // TEXn
+                public List<VDElem> RawElems = new();
+            }
+
+            static string VertexTypeName(byte vt) => vt switch
+            {
+                0x01 => "S16",
+                0x02 => "F32",
+                0x03 => "F16",
+                0x04 => "UB",
+                0x05 => "S32K",
+                0x06 => "CMP",
+                0x07 => "UB256",
+                _ => $"0x{vt:X2}"
+            };
+
+            static VDInfo ParseVDES(byte[] d, int start, int end, Action<string> LOG)
+            {
+                if (start + 16 > d.Length) throw new InvalidDataException("VDES header OOB.");
+                ushort nElem = BE.U16(d, start + 10);
+                var elems = new List<VDElem>(nElem);
+                int eoff = start + 16;
+                for (int i = 0; i < nElem && eoff + 8 <= end; i++, eoff += 8)
+                {
+                    var e = new VDElem
+                    {
+                        VertexType = d[eoff + 0],
+                        NumComponents = d[eoff + 1],
+                        Stream = d[eoff + 2],
+                        Offset = d[eoff + 3],
+                        Stride = BE.U16(d, eoff + 4),
+                        Type = d[eoff + 6],
+                        Class = d[eoff + 7]
+                    };
+                    elems.Add(e);
+                }
+                int stride = elems.Select(e => (int)e.Stride).DefaultIfEmpty(0).Max();
+                if (stride <= 0) stride = 32;
+
+                var vd = new VDInfo { Stride = stride, RawElems = elems };
+                foreach (var e in elems)
+                {
+                    switch (e.Type)
+                    {
+                        case 0: if (vd.PosElem == null) vd.PosElem = e; break;
+                        case 2: if (vd.NormalElem == null) vd.NormalElem = e; break;
+                        case 14: if (vd.TangentElem == null) vd.TangentElem = e; break;
+                        case 15: if (vd.BinormalElem == null) vd.BinormalElem = e; break;
+                        case 8:
+                        case 9:
+                        case 10:
+                        case 11:
+                        case 12:
+                        case 13:
+                            int ti = e.Type - 8; if (!vd.TexElems.ContainsKey(ti)) vd.TexElems[ti] = e; break;
+                    }
+                }
+                return vd;
+            }
+
+            static Vec3 DecodePosition(byte[] d, int vOff, VDElem? posElem)
+            {
+                if (posElem == null) { if (vOff + 12 <= d.Length) return new Vec3(BE.F32(d, vOff + 0), BE.F32(d, vOff + 4), BE.F32(d, vOff + 8)); return new Vec3(0, 0, 0); }
+                var e = posElem.Value; int off = vOff + e.Offset;
+                switch (e.VertexType)
+                {
+                    case 0x02: if (off + 12 <= d.Length) return new Vec3(BE.F32(d, off + 0), BE.F32(d, off + 4), BE.F32(d, off + 8)); break;
+                    case 0x01:
+                    case 0x05: if (off + 6 <= d.Length) return new Vec3(BE.I16(d, off + 0), BE.I16(d, off + 2), BE.I16(d, off + 4)); break;
+                }
+                return new Vec3(0, 0, 0);
+            }
+
+            static Vec2 DecodeUV(byte[] d, int vOff, VDInfo vd)
+            {
+                if (!vd.TexElems.TryGetValue(0, out var e)) return new Vec2(0, 0);
+                int off = vOff + e.Offset;
+                switch (e.VertexType)
+                {
+                    case 0x03: if (off + 4 <= d.Length) return new Vec2(BE.HalfToFloat(BE.U16(d, off + 0)), BE.HalfToFloat(BE.U16(d, off + 2))); break;
+                    case 0x01:
+                    case 0x05: if (off + 4 <= d.Length) return new Vec2(BE.I16(d, off + 0), BE.I16(d, off + 2)); break;
+                    case 0x02: if (off + 8 <= d.Length) return new Vec2(BE.F32(d, off + 0), BE.F32(d, off + 4)); break;
+                    case 0x04: if (off + 2 <= d.Length) return new Vec2(d[off + 0] / 255f, d[off + 1] / 255f); break;
+                    case 0x07: if (off + 2 <= d.Length) return new Vec2(d[off + 0], d[off + 1]); break;
+                }
+                return new Vec2(0, 0);
+            }
+
+            static Vec3 DecodeDir(byte[] d, int vOff, VDElem? elem)
+            {
+                if (elem == null) return new Vec3(0, 0, 1);
+                var e = elem.Value; int off = vOff + e.Offset;
+                if (e.VertexType == 0x06) // CMP packed
+                {
+                    if (off + 4 <= d.Length) return DecodeDec3nPS3(d, off);
+                    return new Vec3(1, 0, 0);
+                }
+                if (e.VertexType == 0x01 && e.NumComponents == 2) // Oct16
+                {
+                    if (off + 4 <= d.Length) return DecodeOct16BE(d, off);
+                    return new Vec3(1, 0, 0);
+                }
+                if (e.VertexType == 0x02 && off + 12 <= d.Length)
+                {
+                    var v = new Vec3(BE.F32(d, off + 0), BE.F32(d, off + 4), BE.F32(d, off + 8));
+                    return Vec3.Normalize(v);
+                }
+                if (e.VertexType == 0x01 && e.NumComponents >= 3 && off + 6 <= d.Length)
+                {
+                    float x = Math.Max(-1f, Math.Min(1f, BE.I16(d, off + 0) / 32767f));
+                    float y = Math.Max(-1f, Math.Min(1f, BE.I16(d, off + 2) / 32767f));
+                    float z = Math.Max(-1f, Math.Min(1f, BE.I16(d, off + 4) / 32767f));
+                    return Vec3.Normalize(new Vec3(x, y, z));
+                }
+                return new Vec3(0, 0, 1);
+            }
+
+            static void RecomputeNormalsIfNeeded(SubMesh sm)
+            {
+                bool needs = false;
+                if (sm.Triangles.Count == 0) return;
+                if (sm.Normals.Count != sm.Positions.Count) needs = true;
+                else
+                {
+                    int checks = Math.Min(16, sm.Normals.Count); int zeros = 0;
+                    for (int i = 0; i < checks; i++) { var n = sm.Normals[i]; if (Math.Abs(n.X) < 1e-5f && Math.Abs(n.Y) < 1e-5f && Math.Abs(n.Z) < 1e-5f) zeros++; }
+                    if (zeros > checks / 2) needs = true;
+                }
+                if (!needs) return;
+
+                var acc = new Vec3[sm.Positions.Count];
+                foreach (var t in sm.Triangles)
+                {
+                    var a = sm.Positions[t.A]; var b = sm.Positions[t.B]; var c = sm.Positions[t.C];
+                    var n = Vec3.Normalize(Vec3.Cross(b - a, c - a));
+                    acc[t.A] = acc[t.A] + n; acc[t.B] = acc[t.B] + n; acc[t.C] = acc[t.C] + n;
+                }
+                sm.Normals.Clear();
+                for (int i = 0; i < acc.Length; i++) { var n = Vec3.Normalize(acc[i]); if (n.Length() < 1e-6f) n = new Vec3(0, 0, 1); sm.Normals.Add(n); }
+            }
+
+            static void AttachMorphTargets(ParsedScene scene, Action<string> LOG)
+            {
+                var bases = scene.SubMeshes.Where(s => s.Triangles.Count > 0).OrderBy(s => s.VbIndex).ToList();
+                var orphans = scene.SubMeshes.Where(s => s.Triangles.Count == 0 && s.Positions.Count > 0).OrderBy(s => s.VbIndex).ToList();
+                if (orphans.Count == 0 || bases.Count == 0) return;
+
+                var toRemove = new HashSet<SubMesh>();
+                foreach (var m in orphans)
+                {
+                    var baseSm = bases.OrderBy(b => Math.Abs(b.VbIndex - m.VbIndex)).ThenBy(b => Math.Abs(b.VdIndex - m.VdIndex)).FirstOrDefault();
+                    if (baseSm == null) continue;
+
+                    if (baseSm.Positions.Count == m.Positions.Count)
+                    {
+                        var mt = new MorphTarget { Name = $"{m.Name} (VB{m.VbIndex}→Base VB{baseSm.VbIndex})" };
+                        mt.Positions.AddRange(m.Positions);
+                        baseSm.Morphs.Add(mt);
+                        LOG?.Invoke($"[MorphPairing] Direct attach {m.Name} → {baseSm.Name} (V={m.Positions.Count})");
+                        toRemove.Add(m);
+                        continue;
+                    }
+
+                    // No welded mapping variant in this trimmed version (not strictly needed for export)
+                }
+
+                if (toRemove.Count > 0)
+                {
+                    scene.SubMeshes.RemoveAll(s => toRemove.Contains(s));
+                    LOG?.Invoke($"[MorphPairing] Removed {toRemove.Count} VB-only streams from draw list (now {scene.SubMeshes.Count} drawable submeshes).");
+                }
+            }
+
+            // ---- Packed vector helpers (viewer semantics) ----
+            static Vec3 DecodeOct16BE(byte[] d, int off)
+            {
+                short sx = BE.I16(d, off + 0);
+                short sy = BE.I16(d, off + 2);
+                float x = Math.Max(-1f, Math.Min(1f, sx / 32767f));
+                float y = Math.Max(-1f, Math.Min(1f, sy / 32767f));
+
+                float z = 1f - (Math.Abs(x) + Math.Abs(y));
+                if (z < 0f)
+                {
+                    float ox = (1f - Math.Abs(y)) * Math.Sign(x);
+                    float oy = (1f - Math.Abs(x)) * Math.Sign(y);
+                    z = -(1f - (Math.Abs(x) + Math.Abs(y)));
+                    x = ox; y = oy;
+                }
+                var v = new Vec3(x, y, z);
+                return Vec3.Normalize(v);
+            }
+
+            static Vec3 DecodeDec3nPS3(byte[] d, int off)
+            {
+                uint be = BE.U32(d, off);
+                uint v = ((be & 0xFFu) << 24) | ((be & 0xFF00u) << 8) | ((be >> 8) & 0xFF00u) | ((be >> 24) & 0xFFu);
+                int sx = (int)(v & 0x3FFu);
+                int sy = (int)((v >> 10) & 0x3FFu);
+                int sz = (int)((v >> 20) & 0x3FFu);
+                if ((sx & 0x200) != 0) sx -= 1 << 10;
+                if ((sy & 0x200) != 0) sy -= 1 << 10;
+                if ((sz & 0x200) != 0) sz -= 1 << 10;
+                const float k = 1.0f / 511.0f;
+                return Vec3.Normalize(new Vec3(sx * k, sy * k, sz * k));
+            }
+
+            // ---- BE helpers (viewer variant) ----
+            internal static class BE
+            {
+                public static ushort U16(byte[] d, int o) => (ushort)((d[o] << 8) | d[o + 1]);
+                public static short I16(byte[] d, int o) => unchecked((short)U16(d, o));
+                public static uint U32(byte[] d, int o) => ((uint)d[o] << 24) | ((uint)d[o + 1] << 16) | ((uint)d[o + 2] << 8) | d[o + 3];
+                public static float F32(byte[] d, int o) { uint v = U32(d, o); unsafe { return *(float*)&v; } }
+                public static float HalfToFloat(ushort h)
+                {
+                    uint sign = (uint)(h >> 15) & 0x1u;
+                    uint exp = (uint)(h >> 10) & 0x1Fu;
+                    uint mant = (uint)h & 0x3FFu;
+                    uint f;
+                    if (exp == 0)
+                    {
+                        if (mant == 0) f = sign << 31;
+                        else
+                        {
+                            while ((mant & 0x400u) == 0) { mant <<= 1; exp--; }
+                            mant &= 0x3FFu;
+                            exp = (uint)(127 - 15 + 1 + (int)exp);
+                            f = (sign << 31) | (exp << 23) | (mant << 13);
+                        }
+                    }
+                    else if (exp == 31)
+                    {
+                        f = (sign << 31) | 0x7F800000u | (mant << 13);
+                    }
+                    else
+                    {
+                        exp = exp + (127 - 15);
+                        f = (sign << 31) | (exp << 23) | (mant << 13);
+                    }
+                    unsafe { return *(float*)&f; }
+                }
+            }
+        }
+
+        // ====== Bone + skin parser core (from user's PSG_BoneSkin_Exporter.cs; semantics preserved + robust finder/palette) ======
+        static class BoneSkinCore
+        {
+            internal static class BE
+            {
+                public static ushort U16(byte[] d, int o) => (ushort)((d[o] << 8) | d[o + 1]);
+                public static uint U32(byte[] d, int o) => ((uint)d[o] << 24) | ((uint)d[o + 1] << 16) | ((uint)d[o + 2] << 8) | d[o + 3];
+                public static float F32(byte[] d, int o) { uint v = U32(d, o); unsafe { return *(float*)&v; } }
+                public static short I16(byte[] d, int o) => unchecked((short)U16(d, o));
+            }
+
+            internal sealed class DictEntry
+            {
+                public int Index;
+                public uint Ptr, Size, Align, TypeIndex, TypeId;
+                public int BlockStart, BlockEnd;
+            }
+
+            internal sealed class Arena
+            {
+                public uint DictStart;
+                public uint ResourceMainBase;
+                public readonly List<uint> Types = new();
+                public readonly List<DictEntry> Dict = new();
+                public bool IsBaseResource(uint typeId) => (typeId >= 0x00010030 && typeId <= 0x0001003F);
+            }
+
+            // Exposed: Parse arena (robust SectionManager pointer detection)
+            public static Arena ParseArena(byte[] d, Action<string> LOG)
+            {
+                if (d.Length < 0x90) throw new InvalidDataException("Too small to be Arena");
+
+                uint numEntries = BE.U32(d, 0x20);
+                uint dictStart = BE.U32(d, 0x30);
+                uint mainBase = BE.U32(d, 0x44);
+
+                var arena = new Arena { DictStart = dictStart, ResourceMainBase = mainBase };
+
+                // Types list via RW_CORE_SECTIONTYPES — try legacy @0xC0 first, fallback to @0x34 (robust)
+                const uint RW_CORE_SECTIONTYPES = 0x00010005;
+
+                uint sectMan = BE.U32(d, 0xC0);
+                bool sectValid(uint p) => p != 0 && p <= (uint)(d.Length - 12);
+
+                if (!sectValid(sectMan))
+                {
+                    uint alt = BE.U32(d, 0x34);
+                    if (sectValid(alt)) { sectMan = alt; LOG?.Invoke("[Types] Using SectionManager @0x34 (fallback)"); }
+                    else { sectMan = 0; LOG?.Invoke("[Types] No valid SectionManager; skipping type remap."); }
+                }
+
+                if (sectMan != 0)
+                {
+                    int pStart = (int)sectMan;
+                    if (pStart >= 0 && pStart + 12 <= d.Length)
+                    {
+                        for (int p = pStart; p <= d.Length - 12; p += 4)
+                        {
+                            uint t = BE.U32(d, p + 0);
+                            if (t != RW_CORE_SECTIONTYPES) continue;
+                            uint num = BE.U32(d, p + 4);
+                            uint dictOff = BE.U32(d, p + 8);
+                            long tp64 = (long)p + (long)dictOff;
+                            if (tp64 < 0 || tp64 > d.Length - 4) break;
+                            int tp = (int)tp64;
+                            for (int i = 0; i < num && (tp + i * 4) <= d.Length - 4; i++) arena.Types.Add(BE.U32(d, tp + i * 4));
+                            LOG?.Invoke($"[Types] count={arena.Types.Count}");
+                            break;
+                        }
+                    }
+                }
+
+                // Dictionary
+                for (int i = 0, q = (int)dictStart; i < numEntries && q + 0x18 <= d.Length; i++, q += 0x18)
+                {
+                    uint ptr = BE.U32(d, q + 0x00);
+                    uint size = BE.U32(d, q + 0x08);
+                    uint align = BE.U32(d, q + 0x0C);
+                    uint typeIndex = BE.U32(d, q + 0x10);
+                    uint typeId = BE.U32(d, q + 0x14);
+                    if (arena.Types.Count > 0 && typeIndex < arena.Types.Count) typeId = arena.Types[(int)typeIndex];
+
+                    long bs64 = arena.IsBaseResource(typeId) ? (long)mainBase + ptr : (long)ptr;
+                    if (bs64 < 0 || bs64 > int.MaxValue) bs64 = -1;
+                    int blockStart = (int)bs64;
+                    int blockEnd = (blockStart >= 0) ? Math.Min(d.Length, Math.Max(blockStart, blockStart + (int)size)) : -1;
+
+                    arena.Dict.Add(new DictEntry { Index = i, Ptr = ptr, Size = size, Align = align, TypeIndex = typeIndex, TypeId = typeId, BlockStart = blockStart, BlockEnd = blockEnd });
+                }
+
+                return arena;
+            }
+
+            // Deterministically find Carrier by RW type family (…0023) then header sanity; fallback to heuristic.
+            private static DictEntry FindCarrier(byte[] d, Arena arena, Action<string> LOG)
+            {
+                static bool InBlock(DictEntry e, int p, int len) => (e.BlockStart >= 0) && (p >= e.BlockStart) && (p + len <= e.BlockEnd);
+                static bool LooksLikeCString(byte[] data, int p, int limit)
+                {
+                    int max = Math.Min(limit, p + 64);
+                    for (int i = p; i < max; i++)
+                    {
+                        byte b = data[i];
+                        if (b == 0) return true;
+                        if (b < 0x20 || b > 0x7E) return false;
+                    }
+                    return false;
+                }
+                bool HeaderValid(DictEntry e)
+                {
+                    if (e.BlockStart < 0 || e.BlockEnd <= e.BlockStart) return false;
+                    long hdr64 = (long)e.BlockStart + 0x20;
+                    if (hdr64 < 0 || hdr64 + 0x24 > d.Length) return false;
+                    int hdr = (int)hdr64;
+
+                    uint offIBM = BE.U32(d, hdr + 0x00);
+                    uint offTblIdx = BE.U32(d, hdr + 0x08);
+                    uint offNames = BE.U32(d, hdr + 0x0C);
+                    ushort boneCount = BE.U16(d, hdr + 0x14);
+                    if (boneCount == 0 || boneCount > 512) return false;
+
+                    int ibmAbs = e.BlockStart + (int)offIBM;
+                    int idxAbs = e.BlockStart + (int)offTblIdx;
+                    int nameAbs = e.BlockStart + (int)offNames;
+
+                    if (!InBlock(e, ibmAbs, boneCount * 64)) return false;
+                    if (!InBlock(e, idxAbs, boneCount * 4)) return false;
+                    if (!InBlock(e, nameAbs, 1)) return false;
+
+                    int rel0 = (int)BE.U32(d, idxAbs + 0);
+                    int p0 = e.BlockStart + rel0;
+                    if (!InBlock(e, p0, 1)) return false;
+                    if (!LooksLikeCString(d, p0, e.BlockEnd)) return false;
+
+                    return true;
+                }
+
+                // Strategy A: typed-first by family …0023
+                var typed = arena.Dict.Where(e => !arena.IsBaseResource(e.TypeId) && (e.TypeId & 0xFFFFu) == 0x0023u).OrderBy(e => e.Index).ToList();
+                foreach (var e in typed) if (HeaderValid(e)) { LOG?.Invoke($"[Carrier] typed match dict#{e.Index} type=0x{e.TypeId:X8} (…0023)"); return e; }
+
+                // Strategy B: heuristic header scan
+                foreach (var e in arena.Dict.Where(e => !arena.IsBaseResource(e.TypeId)).OrderBy(e => e.Index))
+                    if (HeaderValid(e)) { LOG?.Invoke($"[Carrier] heuristic match dict#{e.Index} type=0x{e.TypeId:X8}"); return e; }
+
+                throw new InvalidDataException("Carrier header not found deterministically.");
+            }
+
+            // Minimal VDES to find INDICES/WEIGHTS for probe/identity decision
+            internal sealed class VDElem
+            {
+                public byte VertexType; public byte NumComponents; public byte Stream; public byte Offset; public ushort Stride; public byte Type; public byte Class;
+            }
+            internal sealed class VDInfo
+            {
+                public int Stride; public List<VDElem> RawElems = new();
+            }
+            public static VDInfo ParseVDES(byte[] d, int start, int end)
+            {
+                if (start + 16 > d.Length) throw new InvalidDataException("VDES header OOB.");
+                int nElem = BE.U16(d, start + 10);
+                var elems = new List<VDElem>(nElem);
+                int eoff = start + 16;
+                for (int i = 0; i < nElem && eoff + 8 <= end; i++, eoff += 8)
+                {
+                    var e = new VDElem
+                    {
+                        VertexType = d[eoff + 0],
+                        NumComponents = d[eoff + 1],
+                        Stream = d[eoff + 2],
+                        Offset = d[eoff + 3],
+                        Stride = BE.U16(d, eoff + 4),
+                        Type = d[eoff + 6],
+                        Class = d[eoff + 7]
+                    };
+                    elems.Add(e);
+                }
+                int stride = elems.Select(e => (int)e.Stride).DefaultIfEmpty(0).Max();
+                if (stride <= 0) stride = 32;
+                return new VDInfo { Stride = stride, RawElems = elems };
+            }
+
+            // Public: Full bones + palette (+ possibly identity palette) + binds/ibms
+            public static BoneSkinData ParseBonesAndPaletteAndMaybeSkin(byte[] d, Action<string> LOG)
+            {
+                var arena = ParseArena(d, LOG);
+                var carrier = FindCarrier(d, arena, LOG);
+                LOG?.Invoke($"[Carrier] dict#{carrier.Index} @0x{carrier.BlockStart:X} size=0x{carrier.Size:X}");
+
+                // Header @ Carrier + 0x20 (as-is)
+                int hdr = carrier.BlockStart + 0x20;
+                int offIBM = (int)BE.U32(d, hdr + 0x00);
+                int offTblIdx = (int)BE.U32(d, hdr + 0x08);
+                int offNames = (int)BE.U32(d, hdr + 0x0C);
+                int boneCount = BE.U16(d, hdr + 0x14);
+
+                if (boneCount <= 0 || boneCount > 512) throw new InvalidDataException($"Bone count out of range: {boneCount}");
+
+                int ibmAbs = carrier.BlockStart + offIBM;
+                int idxAbs = carrier.BlockStart + offTblIdx;
+
+                // Bone names
+                string[] boneNames = new string[boneCount];
+                for (int i = 0; i < boneCount; i++)
+                {
+                    int rel = (int)BE.U32(d, idxAbs + 4 * i);
+                    int p = carrier.BlockStart + rel;
+                    boneNames[i] = ReadCString(d, p);
+                }
+                LOG?.Invoke($"[Bones] count={boneCount}");
+                for (int i = 0; i < boneCount; i++) LOG?.Invoke($"  [{i,2}] {boneNames[i]}");
+
+                // IBMs row-major
+                var ibms = new List<float[,]>(boneCount);
+                for (int i = 0; i < boneCount; i++)
+                {
+                    int mOff = ibmAbs + i * 64;
+                    if (mOff + 64 > d.Length) throw new InvalidDataException("IBM OOB");
+                    var m = new float[4, 4];
+                    int q = mOff;
+                    for (int r = 0; r < 4; r++)
+                        for (int c = 0; c < 4; c++)
+                            m[r, c] = BE.F32(d, q + (r * 16) + (c * 4));
+                    ibms.Add(m);
+                }
+                LOG?.Invoke($"[IBMs] read {ibms.Count} matrices @0x{ibmAbs:X}");
+
+                // Invert → bind matrices
+                var binds = new List<float[,]>(boneCount);
+                for (int i = 0; i < boneCount; i++)
+                {
+                    var inv = Inverse4x4(ibms[i]);
+                    if (inv == null) throw new InvalidDataException($"IBM[{i}] not invertible.");
+                    binds.Add(inv);
+                }
+                LOG?.Invoke("[Bind] inverted all IBMs.");
+
+                // Palette: try exact 0x00EB0023 → family …0023 → identity if JOINTS look global
+                var paletteEntry = arena.Dict.FirstOrDefault(e => e.TypeId == 0x00EB0023);
+                if (paletteEntry == null)
+                    paletteEntry = arena.Dict.FirstOrDefault(e => (e.TypeId & 0xFFFFu) == 0x0023u);
+
+                int[] palette = null;
+                if (paletteEntry != null)
+                {
+                    int palStart = paletteEntry.BlockStart + 0x6C;
+                    var palList = new List<ushort>();
+                    for (int p = palStart; p + 1 < d.Length; p += 2)
+                    {
+                        ushort v = BE.U16(d, p);
+                        if (v >= boneCount) break;
+                        palList.Add(v);
+                    }
+                    if (palList.Count == 0) throw new InvalidDataException("Bone palette empty.");
+                    palette = palList.Select(x => (int)x).ToArray();
+                    LOG?.Invoke($"[Palette] {palette.Length} slots @ dict#{paletteEntry.Index} +0x6C");
+                }
+                else
+                {
+                    // Probe JOINTS; if all < boneCount, assume global indices → identity 0..N
+                    // Find a VDES with both indices & weights, pick its VB after it
+                    var vdesList = arena.Dict.Where(x => x.TypeId == 0x000200E9).OrderBy(x => x.Index).ToList();
+                    var vbList = arena.Dict.Where(x => x.TypeId == 0x000200EA).OrderBy(x => x.Index).ToList();
+                    if (vdesList.Count == 0 || vbList.Count == 0) throw new InvalidDataException("No VDES/VB found.");
+
+                    VDInfo chosenVD = null; DictEntry chosenVDEntry = null;
+                    foreach (var vdE in vdesList)
+                    {
+                        var vd = ParseVDES(d, vdE.BlockStart, vdE.BlockEnd);
+                        bool hasIdx = vd.RawElems.Any(e => e.Type == 7);
+                        bool hasWgt = vd.RawElems.Any(e => e.Type == 1);
+                        if (hasIdx && hasWgt) { chosenVD = vd; chosenVDEntry = vdE; break; }
+                    }
+                    if (chosenVD == null) throw new InvalidDataException("No VDES with both INDICES and WEIGHTS.");
+                    var vbEntry = vbList.Where(v => v.Index > chosenVDEntry.Index).OrderBy(v => v.Index).FirstOrDefault() ?? vbList.First();
+
+                    if (vbEntry.BlockStart + 12 > d.Length) throw new InvalidDataException("VB header OOB.");
+                    uint vbBRIndex = BE.U32(d, vbEntry.BlockStart + 0);
+                    var brVB = arena.Dict.ElementAtOrDefault((int)vbBRIndex);
+                    if (brVB == null || !arena.IsBaseResource(brVB.TypeId)) throw new InvalidDataException("VB→BaseResource invalid.");
+                    int vbStart = brVB.BlockStart; int vbSize = (int)brVB.Size; int stride = chosenVD.Stride > 0 ? chosenVD.Stride : 32; int vertexCount = Math.Max(0, vbSize / Math.Max(1, stride));
+
+                    var elIdx = chosenVD.RawElems.First(e => e.Type == 7);
+                    bool looksGlobal = true;
+                    int sample = Math.Min(vertexCount, 4096);
+                    for (int v = 0; v < sample && looksGlobal; v++)
+                    {
+                        int baseOff = vbStart + v * stride;
+                        byte i0 = (baseOff + elIdx.Offset + 0 < d.Length) ? d[baseOff + elIdx.Offset + 0] : (byte)0;
+                        byte i1 = (baseOff + elIdx.Offset + 1 < d.Length) ? d[baseOff + elIdx.Offset + 1] : (byte)0;
+                        byte i2 = (baseOff + elIdx.Offset + 2 < d.Length) ? d[baseOff + elIdx.Offset + 2] : (byte)0;
+                        byte i3 = (baseOff + elIdx.Offset + 3 < d.Length) ? d[baseOff + elIdx.Offset + 3] : (byte)0;
+                        if (i0 >= boneCount || i1 >= boneCount || i2 >= boneCount || i3 >= boneCount) looksGlobal = false;
+                    }
+
+                    if (looksGlobal)
+                    {
+                        int cap = Math.Min(256, boneCount);
+                        palette = Enumerable.Range(0, cap).ToArray();
+                        LOG?.Invoke($"[Palette] not found; JOINTS look global. Using identity 0..{cap - 1}.");
+                    }
+                    else
+                    {
+                        throw new InvalidDataException("Bone palette not found and JOINT indices exceed boneCount (not global).");
+                    }
+                }
+
+                // Parents from provided hierarchy map by name (case-insensitive)
+                var nameToIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < boneCount; i++) nameToIndex[boneNames[i]] = i;
+                var parents = Enumerable.Repeat(-1, boneCount).ToArray();
+                foreach (var kv in BoneHierarchy)
+                {
+                    if (!nameToIndex.TryGetValue(kv.Key, out int childIdx)) continue;
+                    if (kv.Value != null && nameToIndex.TryGetValue(kv.Value, out int parIdx)) parents[childIdx] = parIdx;
+                    else parents[childIdx] = -1;
+                }
+
+                return new BoneSkinData
+                {
+                    BoneCount = boneCount,
+                    BoneNames = boneNames,
+                    IBMs = ibms,
+                    BindMatrices = binds,
+                    Parents = parents,
+                    Palette = palette
+                };
+            }
+
+            private static string ReadCString(byte[] d, int off)
+            {
+                if (off < 0 || off >= d.Length) return "";
+                int p = off;
+                var sb = new StringBuilder(32);
+                while (p < d.Length && d[p] != 0) { sb.Append((char)d[p]); p++; }
+                return sb.ToString();
+            }
+        }
+
+        // ====== GLB builder ======
+        sealed class GlbBuilder
+        {
+            public class Node
+            {
+                public string name { get; set; }
+                public float[] matrix { get; set; } // column-major 16
+                public List<int> children { get; set; }
+                public int? mesh { get; set; }
+                public int? skin { get; set; }
+            }
+            public class Mesh
+            {
+                public string name { get; set; }
+                public List<Primitive> primitives { get; set; } = new();
+                public MeshExtras extras { get; set; }
+            }
+            public class MeshExtras { public List<string> targetNames { get; set; } }
+            public class Primitive
+            {
+                public Dictionary<string, int> attributes { get; set; } = new();
+                public int indices { get; set; }
+                public int material { get; set; }
+                public int mode { get; set; } = 4; // TRIANGLES
+                public List<Dictionary<string, int>> targets { get; set; } // optional
+            }
+            public class Accessor
+            {
+                public int bufferView { get; set; }
+                public int byteOffset { get; set; } = 0;
+                public int componentType { get; set; } // 5123, 5125, 5126, 5121
+                public int count { get; set; }
+                public string type { get; set; } // "SCALAR","VEC2","VEC3","VEC4","MAT4"
+                public float[] min { get; set; } // only for positions
+                public float[] max { get; set; }
+                public bool? normalized { get; set; } // for UBYTE joints if needed
+            }
+            public class BufferView
+            {
+                public int buffer { get; set; } = 0;
+                public int byteOffset { get; set; }
+                public int byteLength { get; set; }
+                public int? target { get; set; } // 34962 ARRAY_BUFFER, 34963 ELEMENT_ARRAY_BUFFER
+                public int? byteStride { get; set; }
+            }
+            public class Buffer { public int byteLength { get; set; } }
+            public class Material { public PbrMetallicRoughness pbrMetallicRoughness { get; set; } = new(); }
+            public class PbrMetallicRoughness { public float[] baseColorFactor { get; set; } = new[] { 0.8f, 0.8f, 0.85f, 1f }; public float metallicFactor { get; set; } = 0.0f; public float roughnessFactor { get; set; } = 1.0f; }
+            public class Skin { public List<int> joints { get; set; } public int? inverseBindMatrices { get; set; } public int? skeleton { get; set; } }
+            public class Scene { public List<int> nodes { get; set; } = new(); }
+
+            public class Target { public List<float> PositionDeltas; }
+
+            public List<Node> Nodes => gltf.nodes;
+
+            // Internal GLTF model
+            private Gltf gltf = new Gltf();
+            private List<byte> bin = new List<byte>();
+            private Action<string> LOG;
+
+            class Gltf
+            {
+                public Asset asset { get; set; } = new Asset();
+                public List<Scene> scenes { get; set; } = new() { new Scene() };
+                public int scene { get; set; } = 0;
+                public List<Node> nodes { get; set; } = new();
+                public List<Mesh> meshes { get; set; } = new();
+                public List<Accessor> accessors { get; set; } = new();
+                public List<BufferView> bufferViews { get; set; } = new();
+                public List<Buffer> buffers { get; set; } = new() { new Buffer() };
+                public List<Material> materials { get; set; } = new();
+                public List<Skin> skins { get; set; } = new();
+            }
+            class Asset { public string version { get; set; } = "2.0"; public string generator { get; set; } = "PSG2GLB"; }
+
+            public GlbBuilder(Action<string> log = null) { LOG = log; }
+
+            public int AddDefaultMaterial()
+            {
+                gltf.materials.Add(new Material());
+                return gltf.materials.Count - 1;
+            }
+
+            public int BeginMesh(string name)
+            {
+                gltf.meshes.Add(new Mesh { name = name });
+                return gltf.meshes.Count - 1;
+            }
+            public void SetMeshTargetNames(int meshIndex, List<string> names)
+            {
+                if (meshIndex < 0 || meshIndex >= gltf.meshes.Count) return;
+                gltf.meshes[meshIndex].extras ??= new MeshExtras();
+                gltf.meshes[meshIndex].extras.targetNames = names;
+            }
+
+            public int AddNode(Node n) { gltf.nodes.Add(n); return gltf.nodes.Count - 1; }
+            public void AddSceneNode(int nodeIndex) { gltf.scenes[0].nodes.Add(nodeIndex); }
+
+            public int AddSkin(List<int> jointNodeIndices, int skeletonNode, List<float> ibmColMajor)
+            {
+                // Write IBM accessor
+                int bv = AddBufferViewFloat(ibmColMajor, target: null, byteStride: null, align: 4);
+                int acc = AddAccessor(bv, 0, componentType: 5126, count: ibmColMajor.Count / 16, type: "MAT4", min: null, max: null);
+                gltf.skins.Add(new Skin { joints = jointNodeIndices, inverseBindMatrices = acc, skeleton = skeletonNode });
+                return gltf.skins.Count - 1;
+            }
+
+            // Add a mesh primitive with attributes + indices + optional skin + morph targets
+            public void AddPrimitive(int meshIndex,
+                List<float> positions, List<float> normals, List<float> tangents, List<float> uv0,
+                List<byte> joints, List<float> weights, List<uint> indices, int material,
+                List<Target> targets)
+            {
+                // Positions
+                var posMinMax = ComputeMinMaxVec3(positions);
+                int bvPos = AddBufferViewFloat(positions, 34962, null, 4);
+                int accPos = AddAccessor(bvPos, 0, 5126, positions.Count / 3, "VEC3", posMinMax.min, posMinMax.max);
+
+                // Normals
+                int accNrm = -1; if (normals != null && normals.Count == positions.Count) { int bv = AddBufferViewFloat(normals, 34962, null, 4); accNrm = AddAccessor(bv, 0, 5126, normals.Count / 3, "VEC3", null, null); }
+
+                // Tangents
+                int accTan = -1; if (tangents != null && tangents.Count == (positions.Count / 3) * 4) { int bv = AddBufferViewFloat(tangents, 34962, null, 4); accTan = AddAccessor(bv, 0, 5126, tangents.Count / 4, "VEC4", null, null); }
+
+                // UV0
+                int accUv0 = -1; if (uv0 != null && uv0.Count == (positions.Count / 3) * 2) { int bv = AddBufferViewFloat(uv0, 34962, null, 4); accUv0 = AddAccessor(bv, 0, 5126, uv0.Count / 2, "VEC2", null, null); }
+
+                // Indices (choose 16-bit or 32-bit)
+                bool need32 = positions.Count / 3 > 65535 || indices.Any(i => i > 65535);
+                int bvIdx, accIdx;
+                if (need32)
+                {
+                    var idx32 = indices.Select(i => BitConverter.GetBytes((uint)i)).SelectMany(b => b).ToList();
+                    PadToAlign(bin, 4);
+                    int off = bin.Count; bin.AddRange(idx32);
+                    bvIdx = AddBufferView(off, idx32.Count, 34963, null);
+                    accIdx = AddAccessor(bvIdx, 0, 5125, indices.Count, "SCALAR", null, null);
+                }
+                else
+                {
+                    var idx16 = indices.Select(i => BitConverter.GetBytes((ushort)i)).SelectMany(b => b).ToList();
+                    PadToAlign(bin, 2);
+                    int off = bin.Count; bin.AddRange(idx16);
+                    bvIdx = AddBufferView(off, idx16.Count, 34963, null);
+                    accIdx = AddAccessor(bvIdx, 0, 5123, indices.Count, "SCALAR", null, null);
+                }
+
+                // Skin
+                int accJoints = -1, accWeights = -1;
+                if (joints != null && weights != null && joints.Count == (positions.Count / 3) * 4 && weights.Count == (positions.Count / 3) * 4)
+                {
+                    // JOINTS_0 as UNSIGNED_BYTE VEC4 (normalized=false)
+                    PadToAlign(bin, 4);
+                    int offJ = bin.Count; bin.AddRange(joints);
+                    // pad to 4-byte length
+                    while ((bin.Count - offJ) % 4 != 0) bin.Add(0);
+                    int bvJ = AddBufferView(offJ, bin.Count - offJ, 34962, 4);
+                    accJoints = AddAccessor(bvJ, 0, 5121, joints.Count / 4, "VEC4", null, null); // 5121 = UNSIGNED_BYTE
+
+                    // WEIGHTS_0 as FLOAT VEC4
+                    int bvW = AddBufferViewFloat(weights, 34962, 16, 4);
+                    accWeights = AddAccessor(bvW, 0, 5126, weights.Count / 4, "VEC4", null, null);
+                }
+
+                // Morph targets
+                List<Dictionary<string, int>> gltfTargets = null;
+                if (targets != null && targets.Count > 0)
+                {
+                    gltfTargets = new List<Dictionary<string, int>>(targets.Count);
+                    foreach (var t in targets)
+                    {
+                        int bvPd = AddBufferViewFloat(t.PositionDeltas, 34962, null, 4);
+                        int accPd = AddAccessor(bvPd, 0, 5126, t.PositionDeltas.Count / 3, "VEC3", null, null);
+                        gltfTargets.Add(new Dictionary<string, int> { { "POSITION", accPd } });
+                    }
+                }
+
+                var prim = new Primitive
+                {
+                    indices = accIdx,
+                    material = material,
+                    attributes = new Dictionary<string, int> { { "POSITION", accPos } },
+                    targets = gltfTargets
+                };
+                if (accNrm >= 0) prim.attributes["NORMAL"] = accNrm;
+                if (accTan >= 0) prim.attributes["TANGENT"] = accTan;
+                if (accUv0 >= 0) prim.attributes["TEXCOORD_0"] = accUv0;
+                if (accJoints >= 0 && accWeights >= 0) { prim.attributes["JOINTS_0"] = accJoints; prim.attributes["WEIGHTS_0"] = accWeights; }
+
+                gltf.meshes[meshIndex].primitives.Add(prim);
+            }
+
+            private (float[] min, float[] max) ComputeMinMaxVec3(List<float> v)
+            {
+                float minX = float.PositiveInfinity, minY = float.PositiveInfinity, minZ = float.PositiveInfinity;
+                float maxX = float.NegativeInfinity, maxY = float.NegativeInfinity, maxZ = float.NegativeInfinity;
+                for (int i = 0; i < v.Count; i += 3)
+                {
+                    float x = v[i], y = v[i + 1], z = v[i + 2];
+                    if (x < minX) minX = x; if (y < minY) minY = y; if (z < minZ) minZ = z;
+                    if (x > maxX) maxX = x; if (y > maxY) maxY = y; if (z > maxZ) maxZ = z;
+                }
+                return (new[] { minX, minY, minZ }, new[] { maxX, maxY, maxZ });
+            }
+
+            private int AddAccessor(int bufferView, int byteOffset, int componentType, int count, string type, float[] min, float[] max)
+            {
+                gltf.accessors.Add(new Accessor { bufferView = bufferView, byteOffset = byteOffset, componentType = componentType, count = count, type = type, min = min, max = max });
+                return gltf.accessors.Count - 1;
+            }
+
+            private int AddBufferView(int byteOffset, int byteLength, int? target, int? byteStride)
+            {
+                gltf.bufferViews.Add(new BufferView { buffer = 0, byteOffset = byteOffset, byteLength = byteLength, target = target, byteStride = byteStride });
+                return gltf.bufferViews.Count - 1;
+            }
+
+            private int AddBufferViewFloat(List<float> data, int? target, int? byteStride, int align)
+            {
+                PadToAlign(bin, align);
+                int off = bin.Count;
+                foreach (var f in data) bin.AddRange(BitConverter.GetBytes(f)); // little-endian
+                return AddBufferView(off, bin.Count - off, target, byteStride);
+            }
+
+            static void PadToAlign(List<byte> b, int align)
+            {
+                while ((b.Count % align) != 0) b.Add(0);
+            }
+
+            public byte[] BuildGlb()
+            {
+                gltf.buffers[0].byteLength = bin.Count;
+
+                var opts = new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
+                string json = JsonSerializer.Serialize(gltf, opts);
+                // Pad JSON with spaces to 4-byte boundary
+                int jsonByteLength = Encoding.UTF8.GetByteCount(json);
+                int jsonPadded = (jsonByteLength + 3) & ~3;
+                int jsonPadSpaces = jsonPadded - jsonByteLength;
+                var jsonBytes = new byte[jsonPadded];
+                Encoding.UTF8.GetBytes(json, 0, json.Length, jsonBytes, 0);
+                for (int i = jsonByteLength; i < jsonPadded; i++) jsonBytes[i] = 0x20; // spaces
+
+                // Bin chunk: already padded to required alignment for views; ensure 4-byte for chunk
+                while ((bin.Count % 4) != 0) bin.Add(0);
+                var binBytes = bin.ToArray();
+
+                // GLB header
+                using var ms = new MemoryStream();
+                using var bw = new BinaryWriter(ms);
+                bw.Write(0x46546C67); // magic 'glTF'
+                bw.Write(2);          // version
+                int totalLength = 12 + 8 + jsonBytes.Length + 8 + binBytes.Length;
+                bw.Write(totalLength);
+
+                // JSON chunk
+                bw.Write(jsonBytes.Length);
+                bw.Write(0x4E4F534A); // 'JSON'
+                bw.Write(jsonBytes);
+
+                // BIN chunk
+                bw.Write(binBytes.Length);
+                bw.Write(0x004E4942); // 'BIN\0'
+                bw.Write(binBytes);
+
+                return ms.ToArray();
+            }
+        }
+
+        // ======= Utilities =======
+
+        // Robust 4x4 inverse (double Gauss–Jordan), row-major
+        private static float[,] Inverse4x4(float[,] m)
+        {
+            int n = 4;
+            double[,] a = new double[n, 2 * n];
+            for (int r = 0; r < n; r++)
+            {
+                for (int c = 0; c < n; c++) a[r, c] = m[r, c];
+                for (int c = 0; c < n; c++) a[r, n + c] = (r == c) ? 1.0 : 0.0;
+            }
+            for (int i = 0; i < n; i++)
+            {
+                int pivot = i; double best = Math.Abs(a[pivot, i]);
+                for (int r = i + 1; r < n; r++) { double v = Math.Abs(a[r, i]); if (v > best) { best = v; pivot = r; } }
+                if (best < 1e-12) return null;
+                if (pivot != i) for (int c = 0; c < 2 * n; c++) { var tmp = a[i, c]; a[i, c] = a[pivot, c]; a[pivot, c] = tmp; }
+                double diag = a[i, i];
+                for (int c = 0; c < 2 * n; c++) a[i, c] /= diag;
+                for (int r = 0; r < n; r++)
+                {
+                    if (r == i) continue;
+                    double f = a[r, i];
+                    if (Math.Abs(f) < 1e-18) continue;
+                    for (int c = 0; c < 2 * n; c++) a[r, c] -= f * a[i, c];
+                }
+            }
+            var inv = new float[n, n];
+            for (int r = 0; r < n; r++) for (int c = 0; c < n; c++) inv[r, c] = (float)a[r, n + c];
+            return inv;
+        }
+
+        // ======= Bone hierarchy mapping (from user's provided dictionary; case-insensitive join) =======
+        private static readonly Dictionary<string, string> BoneHierarchy = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            {"TRAJECTORY", null},
+            {"HIPS", null},
+            {"SPINE", "HIPS"},
+            {"SPINE1", "SPINE"},
+            {"SPINE2", "SPINE1"},
+            {"SPINE3", "SPINE2"},
+            {"NECK", "SPINE3"},
+            {"NECK1", "NECK"},
+            {"HEAD", "NECK1"},
+            {"RIGHTSHOULDER", "SPINE3"},
+            {"RIGHTARM", "RIGHTSHOULDER"},
+            {"RIGHTFOREARM", "RIGHTARM"},
+            {"RIGHTHAND", "RIGHTFOREARM"},
+            {"LEFTSHOULDER", "SPINE3"},
+            {"LEFTARM", "LEFTSHOULDER"},
+            {"LEFTFOREARM", "LEFTARM"},
+            {"LEFTHAND", "LEFTFOREARM"},
+            {"RIGHTUPLEG", "HIPS"},
+            {"RIGHTLEG", "RIGHTUPLEG"},
+            {"RIGHTFOOT", "RIGHTLEG"},
+            {"RIGHTTOEBASE", "RIGHTFOOT"},
+            {"LEFTUPLEG", "HIPS"},
+            {"LEFTLEG", "LEFTUPLEG"},
+            {"LEFTFOOT", "LEFTLEG"},
+            {"LEFTTOEBASE", "LEFTFOOT"},
+            {"SKATEBOARD_ROOT", null},
+            {"TRUCK_FRONT", "SKATEBOARD_ROOT"},
+            {"RIGHT_WHEELFRONT", "TRUCK_FRONT"},
+            {"LEFT_WHEELFRONT", "TRUCK_FRONT"},
+            {"TRUCK_BACK", "SKATEBOARD_ROOT"},
+            {"LEFT_WHEELBACK", "TRUCK_BACK"},
+            {"RIGHT_WHEELBACK", "TRUCK_BACK"},
+            {"LEFTHANDTHUMB1", "LEFTHAND"},
+            {"LEFTHANDTHUMB2", "LEFTHANDTHUMB1"},
+            {"LEFTHANDTHUMB3", "LEFTHANDTHUMB2"},
+            {"LEFTHANDINDEX1", "LEFTHAND"},
+            {"LEFTHANDINDEX2", "LEFTHANDINDEX1"},
+            {"LEFTHANDINDEX3", "LEFTHANDINDEX2"},
+            {"LEFTHANDMIDDLE1", "LEFTHAND"},
+            {"LEFTHANDMIDDLE2", "LEFTHANDMIDDLE1"},
+            {"LEFTHANDMIDDLE3", "LEFTHANDMIDDLE2"},
+            {"LEFTINHANDRING", "LEFTHAND"},
+            {"LEFTHANDRING1", "LEFTINHANDRING"},
+            {"LEFTHANDRING2", "LEFTHANDRING1"},
+            {"LEFTHANDRING3", "LEFTHANDRING2"},
+            {"LEFTINHANDPINKY", "LEFTHAND"},
+            {"LEFTHANDPINKY1", "LEFTINHANDPINKY"},
+            {"LEFTHANDPINKY2", "LEFTHANDPINKY1"},
+            {"LEFTHANDPINKY3", "LEFTHANDPINKY2"},
+            {"RIGHTHANDTHUMB1", "RIGHTHAND"},
+            {"RIGHTHANDTHUMB2", "RIGHTHANDTHUMB1"},
+            {"RIGHTHANDTHUMB3", "RIGHTHANDTHUMB2"},
+            {"RIGHTHANDINDEX1", "RIGHTHAND"},
+            {"RIGHTHANDINDEX2", "RIGHTHANDINDEX1"},
+            {"RIGHTHANDINDEX3", "RIGHTHANDINDEX2"},
+            {"RIGHTHANDMIDDLE1", "RIGHTHAND"},
+            {"RIGHTHANDMIDDLE2", "RIGHTHANDMIDDLE1"},
+            {"RIGHTHANDMIDDLE3", "RIGHTHANDMIDDLE2"},
+            {"RIGHTINHANDRING", "RIGHTHAND"},
+            {"RIGHTHANDRING1", "RIGHTINHANDRING"},
+            {"RIGHTHANDRING2", "RIGHTHANDRING1"},
+            {"RIGHTHANDRING3", "RIGHTHANDRING2"},
+            {"RIGHTINHANDPINKY", "RIGHTHAND"},
+            {"RIGHTHANDPINKY1", "RIGHTINHANDPINKY"},
+            {"RIGHTHANDPINKY2", "RIGHTHANDPINKY1"},
+            {"RIGHTHANDPINKY3", "RIGHTHANDPINKY2"},
+            {"RIGHTTOEBASE_REPARENTED", null},
+            {"LEFTTOEBASE_REPARENTED", null},
+            {"RIGHTHAND_REPARENTED", null},
+            {"LEFTHAND_REPARENTED", null},
+            {"RIGHTSHOULDERHLP", "SPINE3"},
+            {"RIGHTARMTWIST", "RIGHTARM"},
+            {"RIGHTFOREARMTWIST", "RIGHTFOREARM"},
+            {"RIGHTFOREARMTWIST1", "RIGHTFOREARM"},
+            {"LEFTSHOULDERHLP", "SPINE3"},
+            {"LEFTARMTWIST", "LEFTARM"},
+            {"LEFTFOREARMTWIST", "LEFTFOREARM"},
+            {"LEFTFOREARMTWIST1", "LEFTFOREARM"},
+            {"RIGHTUPLEGHLP", "HIPS"},
+            {"RIGHTUPLEGTWIST", "RIGHTUPLEG"},
+            {"LEFTUPLEGHLP", "HIPS"},
+            {"LEFTUPLEGTWIST", "LEFTUPLEG"},
+            {"FACE", "HEAD"},
+            {"OFFSET_JAW", "FACE"},
+            {"JAW", "OFFSET_JAW"},
+            {"OFFSET_CHIN", "JAW"},
+            {"CHIN", "OFFSET_CHIN"},
+            {"OFFSET_LOWERLIP", "JAW"},
+            {"OFFSET_LEFTLOWERLIP", "JAW"},
+            {"OFFSET_RIGHTLOWERLIP", "JAW"},
+            {"OFFSET_TONGUE", "JAW"},
+            {"OFFSET_LEFTCHEEK", "FACE"},
+            {"OFFSET_LEFTEYE", "FACE"},
+            {"OFFSET_LEFTMOUTH", "FACE"},
+            {"OFFSET_LEFTUPCHEEK", "FACE"},
+            {"OFFSET_LEFTUPPERLIP", "FACE"},
+            {"OFFSET_RIGHTCHEEK", "FACE"},
+            {"OFFSET_RIGHTEYE", "FACE"},
+            {"OFFSET_RIGHTMOUTH", "FACE"},
+            {"OFFSET_RIGHTUPCHEEK", "FACE"},
+            {"OFFSET_RIGHTUPPERLIP", "FACE"},
+            {"OFFSET_UPPERLIP", "FACE"},
+            {"TONGUE", "OFFSET_TONGUE"},
+            {"OFFSET_TONGUETIP", "TONGUE"},
+            {"LEFTLOWERLIP", "OFFSET_LEFTLOWERLIP"},
+            {"LOWERLIP", "OFFSET_LOWERLIP"},
+            {"RIGHTLOWERLIP", "OFFSET_RIGHTLOWERLIP"},
+            {"TONGUETIP", "OFFSET_TONGUETIP"},
+            {"LEFTCHEEK", "OFFSET_LEFTCHEEK"},
+            {"LEFTCREASE", "FACE"},
+            {"LEFTEYE", "OFFSET_LEFTEYE"},
+            {"LEFTINNEREYEBROW", "FACE"},
+            {"LEFTLOWEYELID", "FACE"},
+            {"LEFTMOUTH", "OFFSET_LEFTMOUTH"},
+            {"LEFTNOSE", "FACE"},
+            {"LEFTOUTEREYEBROW", "FACE"},
+            {"LEFTUPCHEEK", "OFFSET_LEFTUPCHEEK"},
+            {"LEFTUPEYELID", "FACE"},
+            {"LEFTUPPERLIP", "OFFSET_LEFTUPPERLIP"},
+            {"RIGHTCHEEK", "OFFSET_RIGHTCHEEK"},
+            {"RIGHTCREASE", "FACE"},
+            {"RIGHTEYE", "OFFSET_RIGHTEYE"},
+            {"RIGHTINNEREYEBROW", "FACE"},
+            {"RIGHTLOWEYELID", "FACE"},
+            {"RIGHTMOUTH", "OFFSET_RIGHTMOUTH"},
+            {"RIGHTNOSE", "FACE"},
+            {"RIGHTOUTEREYEBROW", "FACE"},
+            {"RIGHTUPCHEEK", "OFFSET_RIGHTUPCHEEK"},
+            {"RIGHTUPEYELID", "FACE"},
+            {"RIGHTUPPERLIP", "OFFSET_RIGHTUPPERLIP"},
+            {"UPPERLIP", "OFFSET_UPPERLIP"},
+        };
+    }
+}
